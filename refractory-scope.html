@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+<title>REFRACTORY SCOPE — 二色比温度分布モニタ</title>
+<style>
+  @font-face {
+    font-family: 'system-mono';
+    src: local('SF Mono'), local('Menlo'), local('Consolas');
+  }
+  :root{
+    --bg: #101214;
+    --panel: #1a1d21;
+    --panel-2: #23272c;
+    --line: #33383e;
+    --text: #e9e6df;
+    --text-dim: #8a9096;
+    --amber: #ff7a3d;
+    --amber-dim: #ff7a3d55;
+    --steel: #5fa8c4;
+    --steel-dim: #5fa8c455;
+    --danger: #e0483e;
+    --radius: 2px;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Hiragino Sans", "Yu Gothic", sans-serif;
+    overscroll-behavior: none;
+    user-select: none;
+  }
+  #app {
+    position: fixed; inset: 0;
+    display: flex; flex-direction: column;
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+
+  /* ---------- Top HUD ---------- */
+  #hud {
+    flex: 0 0 auto;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+    font-family: 'system-mono', monospace;
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+  }
+  #hud .brand {
+    color: var(--amber);
+    font-weight: 700;
+    font-size: 12px;
+  }
+  #hud .brand::before { content: "◆ "; }
+  #hud .status { display: flex; gap: 14px; align-items: center; }
+  #hud .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--text-dim); display: inline-block; margin-right: 5px;
+  }
+  #hud .dot.live { background: var(--danger); box-shadow: 0 0 6px var(--danger); animation: pulse 1.4s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:.35;} }
+
+  /* ---------- Stage (video / canvas) ---------- */
+  #stage {
+    position: relative;
+    isolation: isolate;
+    z-index: 0;
+    flex: 1 1 auto;
+    min-height: 0;
+    background: #000;
+    display: flex; align-items: center; justify-content: center;
+    overflow: hidden;
+  }
+  #video, #viewCanvas {
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    object-fit: contain;
+    z-index: 1;
+  }
+  #video { pointer-events: none; }
+  #video.hidden { display: none; }
+  #viewCanvas.hidden { display: none; }
+
+  #reticle {
+    position: absolute;
+    width: 22px; height: 22px;
+    border: 1px solid var(--amber);
+    border-radius: 50%;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    display: none;
+    box-shadow: 0 0 0 2000px rgba(0,0,0,0.001);
+  }
+  #reticle::before, #reticle::after {
+    content: ""; position: absolute; background: var(--amber);
+  }
+  #reticle::before { width: 1px; height: 8px; left: 50%; top: -10px; transform: translateX(-50%); }
+  #reticle::after  { width: 1px; height: 8px; left: 50%; bottom: -10px; transform: translateX(-50%); }
+
+  #probeReadout {
+    position: absolute;
+    top: 10px; left: 10px;
+    background: rgba(16,18,20,0.82);
+    border: 1px solid var(--line);
+    padding: 8px 10px;
+    font-family: 'system-mono', monospace;
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--steel);
+    display: none;
+    pointer-events: none;
+    min-width: 132px;
+  }
+  #probeReadout .lbl { color: var(--text-dim); }
+  #probeReadout .big { font-size: 15px; color: var(--text); font-weight: 700; }
+
+  #emptyHint {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    padding: 40px;
+    color: var(--text-dim);
+    font-size: 13px;
+    text-align: center;
+    line-height: 1.7;
+    pointer-events: none;
+  }
+
+  /* ---------- Legend ---------- */
+  #legend {
+    position: absolute;
+    right: 12px; top: 12px; bottom: 12px;
+    width: 14px;
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    pointer-events: none;
+  }
+  #legendBar {
+    flex: 1; width: 10px;
+    border: 1px solid rgba(255,255,255,0.25);
+  }
+  #legend .tag {
+    font-family: 'system-mono', monospace;
+    font-size: 9px; color: var(--text-dim);
+    writing-mode: vertical-rl;
+    margin: 4px 0;
+    letter-spacing: 0.1em;
+  }
+
+  /* ---------- Bottom control panel ---------- */
+  #controls {
+    position: relative;
+    z-index: 10;
+    flex: 0 0 auto;
+    background: var(--panel);
+    border-top: 1px solid var(--line);
+    padding: 12px 14px calc(14px + env(safe-area-inset-bottom));
+    touch-action: manipulation;
+  }
+  #controls button {
+    touch-action: manipulation;
+    cursor: pointer;
+  }
+  .rowline {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 10px;
+  }
+  .modeToggle {
+    display: flex; gap: 6px;
+    font-family: 'system-mono', monospace;
+    font-size: 11px;
+  }
+  .modeToggle button {
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    color: var(--text-dim);
+    padding: 6px 10px;
+    border-radius: var(--radius);
+  }
+  .modeToggle button.active {
+    color: var(--bg);
+    background: var(--steel);
+    border-color: var(--steel);
+    font-weight: 700;
+  }
+  .miniLabel {
+    font-family: 'system-mono', monospace;
+    font-size: 10px;
+    color: var(--text-dim);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  #fusionRow { display: flex; align-items: center; gap: 10px; }
+  #fusionSlider { flex: 1; accent-color: var(--amber); }
+
+  #shutterRow {
+    display: flex; align-items: center; justify-content: center;
+    gap: 26px;
+    margin-top: 6px;
+  }
+  .iconBtn {
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    color: var(--text-dim);
+    width: 46px; height: 46px;
+    border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px;
+  }
+  #shutterBtn {
+    width: 70px; height: 70px;
+    border-radius: 50%;
+    background: var(--amber);
+    border: 4px solid #ffb08a;
+    box-shadow: 0 0 0 2px var(--bg);
+  }
+  #shutterBtn:active { background: #e5622a; }
+  #shutterBtn.analyzing { background: var(--panel-2); border-color: var(--line); }
+
+  .hidden-el { display: none !important; }
+
+  #toast {
+    position: fixed; left: 50%; bottom: 130px;
+    transform: translateX(-50%);
+    background: rgba(20,22,24,0.95);
+    border: 1px solid var(--line);
+    padding: 8px 16px;
+    font-size: 12px;
+    color: var(--text);
+    border-radius: var(--radius);
+    opacity: 0;
+    transition: opacity .25s;
+    pointer-events: none !important;
+    z-index: 50;
+  }
+  #toast.show { opacity: 1; }
+
+  a#dlLink { display: none; }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <div id="hud">
+    <div class="brand">REFRACTORY SCOPE</div>
+    <div class="status">
+      <span id="modeReadout">MODE: R/G</span>
+      <span><span class="dot" id="liveDot"></span><span id="stateText">STANDBY</span></span>
+    </div>
+  </div>
+
+  <div id="stage">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="viewCanvas" class="hidden"></canvas>
+    <canvas id="workCanvas" class="hidden-el"></canvas>
+
+    <div id="reticle"></div>
+    <div id="probeReadout">
+      <div class="lbl">RATIO (raw)</div>
+      <div class="big" id="probeRatio">--</div>
+      <div class="lbl" style="margin-top:6px;">REL. LEVEL</div>
+      <div class="big" id="probeLevel">--</div>
+    </div>
+
+    <div id="legend">
+      <span class="tag">HIGH</span>
+      <div id="legendBar"></div>
+      <span class="tag">LOW</span>
+    </div>
+
+    <div id="emptyHint">
+      カメラを起動し、レンガ面を画角に収めてシャッターを押してください。<br>
+      露出・ホワイトバランスが自動調整されるため、撮影のたびに条件が変わります。<br>
+      同一条件での比較には、毎回同じ距離・角度・照明で撮影してください。
+    </div>
+  </div>
+
+  <div id="controls">
+    <div class="rowline">
+      <div class="modeToggle">
+        <button type="button" id="modeRG" class="active">R / G</button>
+        <button type="button" id="modeRB">R / B</button>
+      </div>
+      <div class="miniLabel" id="clipReadout">CLIP 2–98%</div>
+    </div>
+
+    <div class="rowline" id="fusionRow">
+      <span class="miniLabel">質感合成</span>
+      <input type="range" id="fusionSlider" min="0" max="100" value="35">
+      <span class="miniLabel" id="fusionVal">35%</span>
+    </div>
+
+    <div id="shutterRow">
+      <button type="button" class="iconBtn" id="switchCamBtn" title="カメラ切替">⟳</button>
+      <button type="button" id="shutterBtn"></button>
+      <button type="button" class="iconBtn" id="saveBtn" title="保存" disabled>↓</button>
+    </div>
+  </div>
+
+</div>
+
+<div id="toast"></div>
+<a id="dlLink"></a>
+
+<script>
+(function(){
+  const video = document.getElementById('video');
+  const viewCanvas = document.getElementById('viewCanvas');
+  const workCanvas = document.getElementById('workCanvas');
+  const vctx = viewCanvas.getContext('2d', { willReadFrequently: true });
+  const wctx = workCanvas.getContext('2d', { willReadFrequently: true });
+
+  const shutterBtn = document.getElementById('shutterBtn');
+  const switchCamBtn = document.getElementById('switchCamBtn');
+  const saveBtn = document.getElementById('saveBtn');
+  const modeRGBtn = document.getElementById('modeRG');
+  const modeRBBtn = document.getElementById('modeRB');
+  const modeReadout = document.getElementById('modeReadout');
+  const stateText = document.getElementById('stateText');
+  const liveDot = document.getElementById('liveDot');
+  const emptyHint = document.getElementById('emptyHint');
+  const legend = document.getElementById('legend');
+  const legendBar = document.getElementById('legendBar');
+  const reticle = document.getElementById('reticle');
+  const probeReadout = document.getElementById('probeReadout');
+  const probeRatio = document.getElementById('probeRatio');
+  const probeLevel = document.getElementById('probeLevel');
+  const fusionSlider = document.getElementById('fusionSlider');
+  const fusionVal = document.getElementById('fusionVal');
+  const toast = document.getElementById('toast');
+  const dlLink = document.getElementById('dlLink');
+
+  let stream = null;
+  let facingMode = 'environment';
+  let mode = 'RG'; // or 'RB'
+  let lastRatioMap = null;   // Float32Array of raw ratios (unclipped)
+  let lastLuma = null;       // Float32Array normalized luminance 0..1
+  let lastW = 0, lastH = 0;
+  let lastLo = 0, lastHi = 1;
+  let hasCapture = false;
+
+  const MAX_W = 720; // processing width cap for perf
+
+  function showToast(msg){
+    toast.textContent = msg;
+    toast.classList.add('show');
+    clearTimeout(showToast._t);
+    showToast._t = setTimeout(()=> toast.classList.remove('show'), 1800);
+  }
+
+  // ---------- Inferno-ish colormap ----------
+  const stops = [
+    [0.00,   0,   0,   4],
+    [0.13,  31,  12,  72],
+    [0.25,  85,  15, 109],
+    [0.38, 136,  34, 106],
+    [0.50, 186,  54,  85],
+    [0.63, 227,  89,  51],
+    [0.75, 249, 140,  10],
+    [0.87, 249, 201,  50],
+    [1.00, 252, 255, 164]
+  ];
+  function colormap(t){
+    if (t <= 0) return stops[0].slice(1);
+    if (t >= 1) return stops[stops.length-1].slice(1);
+    for (let i=0; i<stops.length-1; i++){
+      const a = stops[i], b = stops[i+1];
+      if (t >= a[0] && t <= b[0]){
+        const f = (t - a[0]) / (b[0] - a[0]);
+        return [
+          a[1] + (b[1]-a[1])*f,
+          a[2] + (b[2]-a[2])*f,
+          a[3] + (b[3]-a[3])*f
+        ];
+      }
+    }
+    return [255,255,255];
+  }
+  function buildLegendGradient(){
+    let css = 'linear-gradient(to top,';
+    const n = 12;
+    for (let i=0;i<=n;i++){
+      const t = i/n;
+      const c = colormap(t);
+      css += ` rgb(${c[0]|0},${c[1]|0},${c[2]|0}) ${ (t*100).toFixed(0) }%${ i<n? ',':''}`;
+    }
+    css += ')';
+    legendBar.style.background = css;
+  }
+  buildLegendGradient();
+
+  // ---------- Camera ----------
+  async function startCamera(){
+    stopCamera();
+    stateText.textContent = 'STARTING';
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: facingMode },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 }
+        },
+        audio: false
+      });
+      video.srcObject = stream;
+      video.classList.remove('hidden');
+      viewCanvas.classList.add('hidden');
+      hasCapture = false;
+      saveBtn.disabled = true;
+      legend.style.display = 'none';
+      probeReadout.style.display = 'none';
+      reticle.style.display = 'none';
+      emptyHint.style.display = 'none';
+      liveDot.classList.add('live');
+      stateText.textContent = 'LIVE';
+      shutterBtn.classList.remove('analyzing');
+    } catch (err){
+      stateText.textContent = 'NO CAMERA';
+      liveDot.classList.remove('live');
+      emptyHint.style.display = 'flex';
+      emptyHint.innerHTML = 'カメラにアクセスできませんでした。<br>Safariの設定でカメラの利用を許可してください。<br><span style="color:#8a9096;font-family:monospace;font-size:10px;">' + (err && err.message ? err.message : '') + '</span>';
+      console.error(err);
+    }
+  }
+  function stopCamera(){
+    if (stream){
+      stream.getTracks().forEach(t=>t.stop());
+      stream = null;
+    }
+  }
+
+  switchCamBtn.addEventListener('click', ()=>{
+    facingMode = (facingMode === 'environment') ? 'user' : 'environment';
+    startCamera();
+  });
+
+  modeRGBtn.addEventListener('click', ()=>{
+    if (mode==='RG') return;
+    mode='RG'; modeRGBtn.classList.add('active'); modeRBBtn.classList.remove('active');
+    modeReadout.textContent = 'MODE: R/G';
+    if (hasCapture) reprocessFromRaw();
+  });
+  modeRBBtn.addEventListener('click', ()=>{
+    if (mode==='RB') return;
+    mode='RB'; modeRBBtn.classList.add('active'); modeRGBtn.classList.remove('active');
+    modeReadout.textContent = 'MODE: R/B';
+    if (hasCapture) reprocessFromRaw();
+  });
+
+  let rawImageData = null; // keep original captured RGBA for reprocessing on mode switch
+
+  // ---------- Capture & process ----------
+  shutterBtn.addEventListener('click', ()=>{
+    if (!stream){ showToast('カメラが起動していません'); return; }
+    captureAndProcess();
+  });
+
+  function captureAndProcess(){
+    stateText.textContent = 'PROCESSING';
+    shutterBtn.classList.add('analyzing');
+
+    const vw = video.videoWidth, vh = video.videoHeight;
+    if (!vw || !vh){ showToast('映像の取得に失敗しました'); shutterBtn.classList.remove('analyzing'); return; }
+
+    const scale = Math.min(1, MAX_W / vw);
+    const w = Math.round(vw * scale);
+    const h = Math.round(vh * scale);
+
+    workCanvas.width = w;
+    workCanvas.height = h;
+    wctx.drawImage(video, 0, 0, w, h);
+    rawImageData = wctx.getImageData(0, 0, w, h);
+    lastW = w; lastH = h;
+
+    // small delay so "PROCESSING" state paints before heavy loop
+    requestAnimationFrame(()=> requestAnimationFrame(processCurrentRaw));
+  }
+
+  function computeRatioAndLuma(imgData, w, h, useMode){
+    const data = imgData.data;
+    const n = w*h;
+    const ratio = new Float32Array(n);
+    const luma = new Float32Array(n);
+    const eps = 4;
+    for (let i=0, p=0; i<n; i++, p+=4){
+      const r = data[p], g = data[p+1], b = data[p+2];
+      const denom = (useMode === 'RG') ? g : b;
+      ratio[i] = r / (denom + eps);
+      luma[i] = (0.299*r + 0.587*g + 0.114*b) / 255;
+    }
+    return { ratio, luma };
+  }
+
+  function percentileClip(arr, loP, hiP){
+    const n = arr.length;
+    const step = Math.max(1, Math.floor(n/20000)); // sample for speed
+    const sample = [];
+    for (let i=0; i<n; i+=step) sample.push(arr[i]);
+    sample.sort((a,b)=>a-b);
+    const lo = sample[Math.floor(sample.length*loP)];
+    const hi = sample[Math.min(sample.length-1, Math.floor(sample.length*hiP))];
+    return [lo, hi];
+  }
+
+  function processCurrentRaw(){
+    const { ratio, luma } = computeRatioAndLuma(rawImageData, lastW, lastH, mode);
+    lastRatioMap = ratio;
+    lastLuma = luma;
+    const [lo, hi] = percentileClip(ratio, 0.02, 0.98);
+    lastLo = lo; lastHi = (hi > lo) ? hi : lo + 1e-6;
+    renderPseudocolor();
+
+    hasCapture = true;
+    saveBtn.disabled = false;
+    legend.style.display = 'flex';
+    probeReadout.style.display = 'block';
+    reticle.style.display = 'block';
+    reticle.style.left = '50%';
+    reticle.style.top = '50%';
+    updateProbeAtNorm(0.5, 0.5);
+
+    video.classList.add('hidden');
+    viewCanvas.classList.remove('hidden');
+    stateText.textContent = 'CAPTURED';
+    liveDot.classList.remove('live');
+    shutterBtn.classList.remove('analyzing');
+    showToast('解析完了 — 画面をタップして各点の比率を確認できます');
+  }
+
+  function reprocessFromRaw(){
+    if (!rawImageData) return;
+    stateText.textContent = 'PROCESSING';
+    requestAnimationFrame(()=> requestAnimationFrame(processCurrentRaw));
+  }
+
+  const fusionAmountGetter = () => parseInt(fusionSlider.value,10)/100;
+
+  function renderPseudocolor(){
+    const w = lastW, h = lastH;
+    viewCanvas.width = w; viewCanvas.height = h;
+    const out = vctx.createImageData(w, h);
+    const od = out.data;
+    const fusion = fusionAmountGetter();
+    for (let i=0, p=0; i<w*h; i++, p+=4){
+      let t = (lastRatioMap[i] - lastLo) / (lastHi - lastLo);
+      if (t<0) t=0; if (t>1) t=1;
+      const c = colormap(t);
+      // texture fusion: blend colormap with local luminance to retain surface detail
+      const l = lastLuma[i];
+      const lumaMix = 0.55 + 0.9*l; // keep colors visible, modulate by brightness
+      const f = fusion;
+      od[p]   = c[0]*(1-f) + (c[0]*lumaMix)*f;
+      od[p+1] = c[1]*(1-f) + (c[1]*lumaMix)*f;
+      od[p+2] = c[2]*(1-f) + (c[2]*lumaMix)*f;
+      od[p+3] = 255;
+    }
+    vctx.putImageData(out, 0, 0);
+  }
+
+  fusionSlider.addEventListener('input', ()=>{
+    fusionVal.textContent = fusionSlider.value + '%';
+    if (hasCapture) renderPseudocolor();
+  });
+
+  // ---------- Probe (tap to inspect) ----------
+  function clientToCanvasNorm(clientX, clientY){
+    const rect = viewCanvas.getBoundingClientRect();
+    // object-fit: contain -> compute letterboxed drawn area
+    const cw = viewCanvas.width, ch = viewCanvas.height;
+    const boxW = rect.width, boxH = rect.height;
+    const scale = Math.min(boxW/cw, boxH/ch);
+    const drawW = cw*scale, drawH = ch*scale;
+    const offX = (boxW - drawW)/2, offY = (boxH - drawH)/2;
+    const x = clientX - rect.left - offX;
+    const y = clientY - rect.top - offY;
+    if (x<0 || y<0 || x>drawW || y>drawH) return null;
+    return { nx: x/drawW, ny: y/drawH, screenX: clientX - rect.left, screenY: clientY - rect.top };
+  }
+
+  function updateProbeAtNorm(nx, ny){
+    if (!lastRatioMap) return;
+    const px = Math.min(lastW-1, Math.max(0, Math.round(nx*lastW)));
+    const py = Math.min(lastH-1, Math.max(0, Math.round(ny*lastH)));
+    const idx = py*lastW + px;
+    const r = lastRatioMap[idx];
+    let level = (r - lastLo) / (lastHi - lastLo);
+    level = Math.min(1, Math.max(0, level));
+    probeRatio.textContent = r.toFixed(3);
+    probeLevel.textContent = (level*100).toFixed(0) + '%';
+  }
+
+  document.getElementById('stage').addEventListener('click', (e)=>{
+    if (!hasCapture) return;
+    const hit = clientToCanvasNorm(e.clientX, e.clientY);
+    if (!hit) return;
+    reticle.style.left = hit.screenX + 'px';
+    reticle.style.top = hit.screenY + 'px';
+    updateProbeAtNorm(hit.nx, hit.ny);
+  });
+
+  // ---------- Save ----------
+  saveBtn.addEventListener('click', ()=>{
+    if (!hasCapture) return;
+    viewCanvas.toBlob((blob)=>{
+      const url = URL.createObjectURL(blob);
+      dlLink.href = url;
+      const ts = new Date().toISOString().replace(/[:.]/g,'-');
+      dlLink.download = `refractory-scope_${mode}_${ts}.png`;
+      dlLink.click();
+      setTimeout(()=>URL.revokeObjectURL(url), 4000);
+      showToast('画像を保存しました');
+    }, 'image/png');
+  });
+
+  // ---------- retake on tapping video again handled by shutter; add long-press hint ----------
+  video.addEventListener('click', ()=>{
+    // tapping the live view just re-focuses attention to shutter; no-op
+  });
+
+  // restart live view: double-tap on captured image? Provide via switch cam? simplest: tap saveBtn area not video.
+  // Add explicit "retake" by tapping reticle area twice quickly is confusing -> add keyboard-free simple rule:
+  viewCanvas.addEventListener('dblclick', ()=>{
+    startCamera();
+  });
+
+  startCamera();
+})();
+</script>
+</body>
+</html>

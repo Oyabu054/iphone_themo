@@ -466,7 +466,12 @@
         video: {
           facingMode: { ideal: facingMode },
           width: { ideal: 1920 },
-          height: { ideal: 1080 }
+          height: { ideal: 1080 },
+          // iOS Safari exposes no exposureCompensation control; requesting a
+          // high frame rate indirectly forces a shorter per-frame exposure
+          // time, which can reduce highlight clipping on very bright scenes
+          // (e.g. a glowing furnace interior)
+          frameRate: { ideal: 60, min: 30 }
         },
         audio: false
       });

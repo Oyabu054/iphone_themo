@@ -234,9 +234,17 @@
     background: var(--amber);
     border: 4px solid #ffb08a;
     box-shadow: 0 0 0 2px var(--bg);
+    display: flex; align-items: center; justify-content: center;
   }
   #shutterBtn:active { background: #e5622a; }
   #shutterBtn.analyzing { background: var(--panel-2); border-color: var(--line); }
+  #shutterIcon { display: none; font-size: 28px; line-height: 1; color: var(--bg); pointer-events: none; }
+  #shutterBtn.retake {
+    background: var(--steel);
+    border-color: #a9d6e6;
+  }
+  #shutterBtn.retake:active { background: #4a90ab; }
+  #shutterBtn.retake #shutterIcon { display: block; }
 
   .hidden-el { display: none !important; }
 
@@ -320,7 +328,7 @@
 
     <div id="shutterRow">
       <button type="button" class="iconBtn" id="switchCamBtn" title="カメラ切替">⟳</button>
-      <button type="button" id="shutterBtn"></button>
+      <button type="button" id="shutterBtn"><span id="shutterIcon">↺</span></button>
       <button type="button" class="iconBtn" id="saveBtn" title="保存" disabled>↓</button>
     </div>
   </div>
@@ -488,6 +496,7 @@
       liveDot.classList.add('live');
       stateText.textContent = 'LIVE';
       shutterBtn.classList.remove('analyzing');
+      shutterBtn.classList.remove('retake');
     } catch (err){
       stateText.textContent = 'NO CAMERA';
       liveDot.classList.remove('live');
@@ -525,6 +534,7 @@
 
   // ---------- Capture & process ----------
   shutterBtn.addEventListener('click', ()=>{
+    if (hasCapture){ startCamera(); return; }
     if (!stream){ showToast('カメラが起動していません'); return; }
     captureAndProcess();
   });
@@ -606,7 +616,8 @@
     stateText.textContent = 'CAPTURED';
     liveDot.classList.remove('live');
     shutterBtn.classList.remove('analyzing');
-    showToast('解析完了 — 画面をタップして各点の比率を確認できます');
+    shutterBtn.classList.add('retake');
+    showToast('解析完了 — シャッターボタンでライブに戻れます');
   }
 
   function reprocessFromRaw(){

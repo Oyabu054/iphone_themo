@@ -74,6 +74,7 @@
     background: #000;
     display: flex; align-items: center; justify-content: center;
     overflow: hidden;
+    touch-action: none;
   }
   #video, #viewCanvas {
     position: absolute; inset: 0;
@@ -81,7 +82,7 @@
     object-fit: contain;
     z-index: 1;
   }
-  #video { pointer-events: none; }
+  #video { pointer-events: none; transform-origin: center center; }
   #video.hidden { display: none; }
   #viewCanvas.hidden { display: none; }
 
@@ -117,6 +118,20 @@
   }
   #probeReadout .lbl { color: var(--text-dim); }
   #probeReadout .big { font-size: 15px; color: var(--text); font-weight: 700; }
+
+  #zoomReadout {
+    position: absolute;
+    top: 10px; left: 50%;
+    transform: translateX(-50%);
+    background: rgba(16,18,20,0.82);
+    border: 1px solid var(--line);
+    padding: 4px 10px;
+    font-family: 'system-mono', monospace;
+    font-size: 11px;
+    color: var(--amber);
+    display: none;
+    pointer-events: none;
+  }
 
   #emptyHint {
     position: absolute; inset: 0;
@@ -196,6 +211,8 @@
   }
   #fusionRow { display: flex; align-items: center; gap: 10px; }
   #fusionSlider { flex: 1; accent-color: var(--amber); }
+  #brightnessRow { display: flex; align-items: center; gap: 10px; }
+  #brightnessSlider { flex: 1; accent-color: var(--steel); }
 
   #shutterRow {
     display: flex; align-items: center; justify-content: center;
@@ -259,6 +276,7 @@
     <canvas id="workCanvas" class="hidden-el"></canvas>
 
     <div id="reticle"></div>
+    <div id="zoomReadout">1.0×</div>
     <div id="probeReadout">
       <div class="lbl">RATIO (raw)</div>
       <div class="big" id="probeRatio">--</div>
@@ -292,6 +310,12 @@
       <span class="miniLabel">質感合成</span>
       <input type="range" id="fusionSlider" min="0" max="100" value="35">
       <span class="miniLabel" id="fusionVal">35%</span>
+    </div>
+
+    <div class="rowline" id="brightnessRow">
+      <span class="miniLabel">輝度補正</span>
+      <input type="range" id="brightnessSlider" min="-50" max="100" value="0">
+      <span class="miniLabel" id="brightnessVal">0%</span>
     </div>
 
     <div id="shutterRow">
@@ -331,6 +355,10 @@
   const probeLevel = document.getElementById('probeLevel');
   const fusionSlider = document.getElementById('fusionSlider');
   const fusionVal = document.getElementById('fusionVal');
+  const brightnessSlider = document.getElementById('brightnessSlider');
+  const brightnessVal = document.getElementById('brightnessVal');
+  const zoomReadout = document.getElementById('zoomReadout');
+  const stageEl = document.getElementById('stage');
   const toast = document.getElementById('toast');
   const dlLink = document.getElementById('dlLink');
 
@@ -344,6 +372,46 @@
   let hasCapture = false;
 
   const MAX_W = 720; // processing width cap for perf
+
+  // ---------- Digital zoom (pinch) ----------
+  const MIN_ZOOM = 1, MAX_ZOOM = 4;
+  let zoomLevel = 1;
+  let pinchStartDist = 0, pinchStartZoom = 1;
+
+  function updateZoomVisual(){
+    video.style.transform = `scale(${zoomLevel})`;
+    if (zoomLevel > 1.02){
+      zoomReadout.textContent = zoomLevel.toFixed(1) + '×';
+      zoomReadout.style.display = 'block';
+    } else {
+      zoomReadout.style.display = 'none';
+    }
+  }
+  function touchDistance(touches){
+    const dx = touches[0].clientX - touches[1].clientX;
+    const dy = touches[0].clientY - touches[1].clientY;
+    return Math.hypot(dx, dy);
+  }
+  stageEl.addEventListener('touchstart', (e)=>{
+    if (hasCapture) return;
+    if (e.touches.length === 2){
+      pinchStartDist = touchDistance(e.touches);
+      pinchStartZoom = zoomLevel;
+    }
+  }, { passive: true });
+  stageEl.addEventListener('touchmove', (e)=>{
+    if (hasCapture) return;
+    if (e.touches.length === 2 && pinchStartDist > 0){
+      e.preventDefault();
+      const dist = touchDistance(e.touches);
+      const scale = dist / pinchStartDist;
+      zoomLevel = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, pinchStartZoom * scale));
+      updateZoomVisual();
+    }
+  }, { passive: false });
+  stageEl.addEventListener('touchend', (e)=>{
+    if (e.touches.length < 2) pinchStartDist = 0;
+  });
 
   function showToast(msg){
     toast.textContent = msg;
@@ -410,6 +478,8 @@
       video.classList.remove('hidden');
       viewCanvas.classList.add('hidden');
       hasCapture = false;
+      zoomLevel = 1;
+      updateZoomVisual();
       saveBtn.disabled = true;
       legend.style.display = 'none';
       probeReadout.style.display = 'none';
@@ -466,13 +536,20 @@
     const vw = video.videoWidth, vh = video.videoHeight;
     if (!vw || !vh){ showToast('映像の取得に失敗しました'); shutterBtn.classList.remove('analyzing'); return; }
 
-    const scale = Math.min(1, MAX_W / vw);
-    const w = Math.round(vw * scale);
-    const h = Math.round(vh * scale);
+    // crop to the region currently visible under the pinch-zoom level, so the
+    // analyzed image matches what was framed in the live preview
+    const cropW = vw / zoomLevel;
+    const cropH = vh / zoomLevel;
+    const cropX = (vw - cropW) / 2;
+    const cropY = (vh - cropH) / 2;
+
+    const scale = Math.min(1, MAX_W / cropW);
+    const w = Math.round(cropW * scale);
+    const h = Math.round(cropH * scale);
 
     workCanvas.width = w;
     workCanvas.height = h;
-    wctx.drawImage(video, 0, 0, w, h);
+    wctx.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, w, h);
     rawImageData = wctx.getImageData(0, 0, w, h);
     lastW = w; lastH = h;
 
@@ -525,6 +602,7 @@
 
     video.classList.add('hidden');
     viewCanvas.classList.remove('hidden');
+    zoomReadout.style.display = 'none';
     stateText.textContent = 'CAPTURED';
     liveDot.classList.remove('live');
     shutterBtn.classList.remove('analyzing');
@@ -538,6 +616,8 @@
   }
 
   const fusionAmountGetter = () => parseInt(fusionSlider.value,10)/100;
+  const brightnessGainGetter = () => 1 + (parseInt(brightnessSlider.value,10)/100);
+  const clamp255 = (v) => v<0 ? 0 : (v>255 ? 255 : v);
 
   function renderPseudocolor(){
     const w = lastW, h = lastH;
@@ -545,6 +625,7 @@
     const out = vctx.createImageData(w, h);
     const od = out.data;
     const fusion = fusionAmountGetter();
+    const gain = brightnessGainGetter();
     for (let i=0, p=0; i<w*h; i++, p+=4){
       let t = (lastRatioMap[i] - lastLo) / (lastHi - lastLo);
       if (t<0) t=0; if (t>1) t=1;
@@ -553,9 +634,11 @@
       const l = lastLuma[i];
       const lumaMix = 0.55 + 0.9*l; // keep colors visible, modulate by brightness
       const f = fusion;
-      od[p]   = c[0]*(1-f) + (c[0]*lumaMix)*f;
-      od[p+1] = c[1]*(1-f) + (c[1]*lumaMix)*f;
-      od[p+2] = c[2]*(1-f) + (c[2]*lumaMix)*f;
+      // brightness correction applies to the final displayed image (independent
+      // of fusion amount), so it also has an effect at 0% texture fusion
+      od[p]   = clamp255((c[0]*(1-f) + (c[0]*lumaMix)*f) * gain);
+      od[p+1] = clamp255((c[1]*(1-f) + (c[1]*lumaMix)*f) * gain);
+      od[p+2] = clamp255((c[2]*(1-f) + (c[2]*lumaMix)*f) * gain);
       od[p+3] = 255;
     }
     vctx.putImageData(out, 0, 0);
@@ -563,6 +646,12 @@
 
   fusionSlider.addEventListener('input', ()=>{
     fusionVal.textContent = fusionSlider.value + '%';
+    if (hasCapture) renderPseudocolor();
+  });
+
+  brightnessSlider.addEventListener('input', ()=>{
+    const v = parseInt(brightnessSlider.value,10);
+    brightnessVal.textContent = (v>0?'+':'') + v + '%';
     if (hasCapture) renderPseudocolor();
   });
 

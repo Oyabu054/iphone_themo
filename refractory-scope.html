@@ -209,6 +209,9 @@
     letter-spacing: 0.08em;
     text-transform: uppercase;
   }
+  #zoomRow { display: flex; align-items: center; gap: 10px; }
+  #zoomSlider { flex: 1; accent-color: var(--amber); }
+  #zoomSlider:disabled { opacity: .35; }
   #fusionRow { display: flex; align-items: center; gap: 10px; }
   #fusionSlider { flex: 1; accent-color: var(--amber); }
   #brightnessRow { display: flex; align-items: center; gap: 10px; }
@@ -314,6 +317,12 @@
       <div class="miniLabel" id="clipReadout">CLIP 2–98%</div>
     </div>
 
+    <div class="rowline" id="zoomRow">
+      <span class="miniLabel">ズーム</span>
+      <input type="range" id="zoomSlider" min="100" max="400" value="100" step="5">
+      <span class="miniLabel" id="zoomVal">1.0×</span>
+    </div>
+
     <div class="rowline" id="fusionRow">
       <span class="miniLabel">質感合成</span>
       <input type="range" id="fusionSlider" min="0" max="100" value="35">
@@ -366,7 +375,8 @@
   const brightnessSlider = document.getElementById('brightnessSlider');
   const brightnessVal = document.getElementById('brightnessVal');
   const zoomReadout = document.getElementById('zoomReadout');
-  const stageEl = document.getElementById('stage');
+  const zoomSlider = document.getElementById('zoomSlider');
+  const zoomVal = document.getElementById('zoomVal');
   const toast = document.getElementById('toast');
   const dlLink = document.getElementById('dlLink');
 
@@ -381,13 +391,12 @@
 
   const MAX_W = 720; // processing width cap for perf
 
-  // ---------- Digital zoom (pinch) ----------
-  const MIN_ZOOM = 1, MAX_ZOOM = 4;
+  // ---------- Digital zoom (slider) ----------
   let zoomLevel = 1;
-  let pinchStartDist = 0, pinchStartZoom = 1;
 
   function updateZoomVisual(){
     video.style.transform = `scale(${zoomLevel})`;
+    zoomVal.textContent = zoomLevel.toFixed(1) + '×';
     if (zoomLevel > 1.02){
       zoomReadout.textContent = zoomLevel.toFixed(1) + '×';
       zoomReadout.style.display = 'block';
@@ -395,30 +404,9 @@
       zoomReadout.style.display = 'none';
     }
   }
-  function touchDistance(touches){
-    const dx = touches[0].clientX - touches[1].clientX;
-    const dy = touches[0].clientY - touches[1].clientY;
-    return Math.hypot(dx, dy);
-  }
-  stageEl.addEventListener('touchstart', (e)=>{
-    if (hasCapture) return;
-    if (e.touches.length === 2){
-      pinchStartDist = touchDistance(e.touches);
-      pinchStartZoom = zoomLevel;
-    }
-  }, { passive: true });
-  stageEl.addEventListener('touchmove', (e)=>{
-    if (hasCapture) return;
-    if (e.touches.length === 2 && pinchStartDist > 0){
-      e.preventDefault();
-      const dist = touchDistance(e.touches);
-      const scale = dist / pinchStartDist;
-      zoomLevel = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, pinchStartZoom * scale));
-      updateZoomVisual();
-    }
-  }, { passive: false });
-  stageEl.addEventListener('touchend', (e)=>{
-    if (e.touches.length < 2) pinchStartDist = 0;
+  zoomSlider.addEventListener('input', ()=>{
+    zoomLevel = parseInt(zoomSlider.value,10) / 100;
+    updateZoomVisual();
   });
 
   function showToast(msg){
@@ -487,6 +475,8 @@
       viewCanvas.classList.add('hidden');
       hasCapture = false;
       zoomLevel = 1;
+      zoomSlider.value = 100;
+      zoomSlider.disabled = false;
       updateZoomVisual();
       saveBtn.disabled = true;
       legend.style.display = 'none';
@@ -546,7 +536,7 @@
     const vw = video.videoWidth, vh = video.videoHeight;
     if (!vw || !vh){ showToast('映像の取得に失敗しました'); shutterBtn.classList.remove('analyzing'); return; }
 
-    // crop to the region currently visible under the pinch-zoom level, so the
+    // crop to the region currently visible under the zoom slider level, so the
     // analyzed image matches what was framed in the live preview
     const cropW = vw / zoomLevel;
     const cropH = vh / zoomLevel;
@@ -613,6 +603,7 @@
     video.classList.add('hidden');
     viewCanvas.classList.remove('hidden');
     zoomReadout.style.display = 'none';
+    zoomSlider.disabled = true;
     stateText.textContent = 'CAPTURED';
     liveDot.classList.remove('live');
     shutterBtn.classList.remove('analyzing');

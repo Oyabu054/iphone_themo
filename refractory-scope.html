@@ -209,6 +209,8 @@
     letter-spacing: 0.08em;
     text-transform: uppercase;
   }
+  #analysisRow { gap: 8px; }
+  #analysisRow .modeToggle button { padding: 5px 8px; }
   #zoomRow { display: flex; align-items: center; gap: 10px; }
   #zoomSlider { flex: 1; accent-color: var(--amber); }
   #zoomSlider:disabled { opacity: .35; }
@@ -314,7 +316,22 @@
         <button type="button" id="modeRG" class="active">R / G</button>
         <button type="button" id="modeRB">R / B</button>
       </div>
-      <div class="miniLabel" id="clipReadout">CLIP 2–98%</div>
+      <div class="miniLabel" id="resReadout">RES —</div>
+    </div>
+
+    <div class="rowline" id="analysisRow">
+      <span class="miniLabel">積算</span>
+      <div class="modeToggle" id="stackGroup">
+        <button type="button" data-stack="1">1</button>
+        <button type="button" data-stack="4" class="active">4</button>
+        <button type="button" data-stack="8">8</button>
+      </div>
+      <span class="miniLabel">コントラスト</span>
+      <div class="modeToggle" id="clipGroup">
+        <button type="button" data-lo="0.005" data-hi="0.995">弱</button>
+        <button type="button" data-lo="0.02" data-hi="0.98" class="active">標準</button>
+        <button type="button" data-lo="0.10" data-hi="0.90">強</button>
+      </div>
     </div>
 
     <div class="rowline" id="zoomRow">
@@ -377,6 +394,9 @@
   const zoomReadout = document.getElementById('zoomReadout');
   const zoomSlider = document.getElementById('zoomSlider');
   const zoomVal = document.getElementById('zoomVal');
+  const resReadout = document.getElementById('resReadout');
+  const stackGroup = document.getElementById('stackGroup');
+  const clipGroup = document.getElementById('clipGroup');
   const toast = document.getElementById('toast');
   const dlLink = document.getElementById('dlLink');
 
@@ -388,8 +408,19 @@
   let lastW = 0, lastH = 0;
   let lastLo = 0, lastHi = 1;
   let hasCapture = false;
+  let isCapturing = false;
 
-  const MAX_W = 720; // processing width cap for perf
+  // Processing width cap. Frame stacking holds the averaged RGB as Float32,
+  // so memory is ~12 bytes/px on top of the ratio and luma maps; 1920 keeps a
+  // 4K source well inside iOS Safari's budget. Fixed (not tied to the stack
+  // count) so captures stay comparable with each other.
+  const MAX_W = 1920;
+
+  // frames averaged per capture — reduces sensor noise by ~1/sqrt(N), which is
+  // what limits tonal resolution when shooting through heavy welding/cobalt glass
+  let stackCount = 4;
+  // percentile clip bounds for contrast stretching
+  let clipLo = 0.02, clipHi = 0.98;
 
   // ---------- Digital zoom (slider) ----------
   let zoomLevel = 1;
@@ -444,6 +475,15 @@
     }
     return [255,255,255];
   }
+  // Precomputed colormap lookup — the per-pixel stop scan above is too slow
+  // once the processing resolution is in the megapixel range.
+  const LUT_N = 1024;
+  const cmapLUT = new Float32Array(LUT_N * 3);
+  for (let i=0; i<LUT_N; i++){
+    const c = colormap(i/(LUT_N-1));
+    cmapLUT[i*3] = c[0]; cmapLUT[i*3+1] = c[1]; cmapLUT[i*3+2] = c[2];
+  }
+
   function buildLegendGradient(){
     let css = 'linear-gradient(to top,';
     const n = 12;
@@ -465,17 +505,24 @@
       stream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: { ideal: facingMode },
-          width: { ideal: 1920 },
-          height: { ideal: 1080 },
-          // iOS Safari exposes no exposureCompensation control; requesting a
-          // high frame rate indirectly forces a shorter per-frame exposure
-          // time, which can reduce highlight clipping on very bright scenes
-          // (e.g. a glowing furnace interior)
-          frameRate: { ideal: 60, min: 30 }
+          // ask for the highest sensor resolution available; `ideal` degrades
+          // gracefully on devices that cannot deliver 4K
+          width: { ideal: 3840 },
+          height: { ideal: 2160 },
+          // a high frame rate would shorten exposure, but on iOS the 60fps
+          // modes are lower resolution — exposure is handled by physical
+          // filtering, so resolution wins here
+          frameRate: { ideal: 30 }
         },
         audio: false
       });
       video.srcObject = stream;
+
+      // report what the device actually granted — the 4K request is only an
+      // `ideal`, so this is the way to confirm the resolution in the field
+      const st = stream.getVideoTracks()[0].getSettings();
+      resReadout.textContent = (st.width && st.height) ? `SRC ${st.width}×${st.height}` : 'SRC —';
+
       video.classList.remove('hidden');
       viewCanvas.classList.add('hidden');
       hasCapture = false;
@@ -508,6 +555,7 @@
   }
 
   switchCamBtn.addEventListener('click', ()=>{
+    if (isCapturing) return; // swapping the source mid-stack would mix two scenes
     facingMode = (facingMode === 'environment') ? 'user' : 'environment';
     startCamera();
   });
@@ -525,21 +573,69 @@
     if (hasCapture) reprocessFromRaw();
   });
 
-  let rawImageData = null; // keep original captured RGBA for reprocessing on mode switch
+  function selectInGroup(group, btn){
+    group.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+  }
+
+  stackGroup.addEventListener('click', (e)=>{
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    stackCount = parseInt(btn.dataset.stack, 10);
+    selectInGroup(stackGroup, btn);
+  });
+
+  clipGroup.addEventListener('click', (e)=>{
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    clipLo = parseFloat(btn.dataset.lo);
+    clipHi = parseFloat(btn.dataset.hi);
+    selectInGroup(clipGroup, btn);
+    // clip bounds only affect the contrast stretch, so a reprocess is enough
+    if (hasCapture) reprocessFromRaw();
+  });
+
+  // averaged RGB of the captured frames, kept as Float32 so mode switches can
+  // be reprocessed without recapturing and so stacking retains sub-LSB detail
+  let rawRGB = null;
+
+  const delay = (ms) => new Promise(r => setTimeout(r, ms));
+  const nextPaint = () => new Promise(r => requestAnimationFrame(()=> requestAnimationFrame(r)));
 
   // ---------- Capture & process ----------
   shutterBtn.addEventListener('click', ()=>{
+    if (isCapturing) return;
     if (hasCapture){ startCamera(); return; }
     if (!stream){ showToast('カメラが起動していません'); return; }
     captureAndProcess();
   });
 
-  function captureAndProcess(){
-    stateText.textContent = 'PROCESSING';
+  async function captureAndProcess(){
+    isCapturing = true;
+    try {
+      await runCapture();
+    } catch (err){
+      console.error(err);
+      showToast('解析に失敗しました（積算枚数を下げてください）');
+      stateText.textContent = 'LIVE';
+      shutterBtn.classList.remove('analyzing');
+    } finally {
+      // must always clear, or the shutter stays permanently dead
+      isCapturing = false;
+    }
+  }
+
+  async function runCapture(){
     shutterBtn.classList.add('analyzing');
+    stateText.textContent = 'PROCESSING';
 
     const vw = video.videoWidth, vh = video.videoHeight;
-    if (!vw || !vh){ showToast('映像の取得に失敗しました'); shutterBtn.classList.remove('analyzing'); return; }
+    if (!vw || !vh){
+      showToast('映像の取得に失敗しました');
+      shutterBtn.classList.remove('analyzing');
+      stateText.textContent = 'LIVE';
+      return;
+    }
 
     // crop to the region currently visible under the zoom slider level, so the
     // analyzed image matches what was framed in the live preview
@@ -554,22 +650,44 @@
 
     workCanvas.width = w;
     workCanvas.height = h;
-    wctx.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, w, h);
-    rawImageData = wctx.getImageData(0, 0, w, h);
     lastW = w; lastH = h;
 
-    // small delay so "PROCESSING" state paints before heavy loop
-    requestAnimationFrame(()=> requestAnimationFrame(processCurrentRaw));
+    const n = w * h;
+    const accum = new Float32Array(n * 3);
+    const frames = stackCount;
+
+    for (let f = 0; f < frames; f++){
+      if (frames > 1) stateText.textContent = `STACK ${f+1}/${frames}`;
+      await nextPaint();
+      wctx.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, w, h);
+      const d = wctx.getImageData(0, 0, w, h).data;
+      for (let i=0, p=0, q=0; i<n; i++, p+=4, q+=3){
+        accum[q]   += d[p];
+        accum[q+1] += d[p+1];
+        accum[q+2] += d[p+2];
+      }
+      // let the camera deliver a genuinely new frame before the next read
+      if (f < frames - 1) await delay(45);
+    }
+
+    const inv = 1 / frames;
+    for (let i=0; i<accum.length; i++) accum[i] *= inv;
+    rawRGB = accum;
+
+    stateText.textContent = 'PROCESSING';
+    await nextPaint();
+    processCurrentRaw();
   }
 
-  function computeRatioAndLuma(imgData, w, h, useMode){
-    const data = imgData.data;
+  function computeRatioAndLuma(rgb, w, h, useMode){
     const n = w*h;
     const ratio = new Float32Array(n);
     const luma = new Float32Array(n);
-    const eps = 4;
-    for (let i=0, p=0; i<n; i++, p+=4){
-      const r = data[p], g = data[p+1], b = data[p+2];
+    // small enough not to distort ratios in the dark values that heavy optical
+    // filtering produces, but still guards against division by zero
+    const eps = 1;
+    for (let i=0, q=0; i<n; i++, q+=3){
+      const r = rgb[q], g = rgb[q+1], b = rgb[q+2];
       const denom = (useMode === 'RG') ? g : b;
       ratio[i] = r / (denom + eps);
       luma[i] = (0.299*r + 0.587*g + 0.114*b) / 255;
@@ -579,7 +697,7 @@
 
   function percentileClip(arr, loP, hiP){
     const n = arr.length;
-    const step = Math.max(1, Math.floor(n/20000)); // sample for speed
+    const step = Math.max(1, Math.floor(n/40000)); // sample for speed
     const sample = [];
     for (let i=0; i<n; i+=step) sample.push(arr[i]);
     sample.sort((a,b)=>a-b);
@@ -589,10 +707,10 @@
   }
 
   function processCurrentRaw(){
-    const { ratio, luma } = computeRatioAndLuma(rawImageData, lastW, lastH, mode);
+    const { ratio, luma } = computeRatioAndLuma(rawRGB, lastW, lastH, mode);
     lastRatioMap = ratio;
     lastLuma = luma;
-    const [lo, hi] = percentileClip(ratio, 0.02, 0.98);
+    const [lo, hi] = percentileClip(ratio, clipLo, clipHi);
     lastLo = lo; lastHi = (hi > lo) ? hi : lo + 1e-6;
     renderPseudocolor();
 
@@ -610,6 +728,7 @@
     zoomReadout.style.display = 'none';
     zoomSlider.disabled = true;
     stateText.textContent = 'CAPTURED';
+    resReadout.textContent = `解析 ${lastW}×${lastH}`;
     liveDot.classList.remove('live');
     shutterBtn.classList.remove('analyzing');
     shutterBtn.classList.add('retake');
@@ -617,7 +736,7 @@
   }
 
   function reprocessFromRaw(){
-    if (!rawImageData) return;
+    if (!rawRGB) return;
     stateText.textContent = 'PROCESSING';
     requestAnimationFrame(()=> requestAnimationFrame(processCurrentRaw));
   }
@@ -631,21 +750,22 @@
     viewCanvas.width = w; viewCanvas.height = h;
     const out = vctx.createImageData(w, h);
     const od = out.data;
-    const fusion = fusionAmountGetter();
+    const f = fusionAmountGetter();
     const gain = brightnessGainGetter();
+    const invRange = 1 / (lastHi - lastLo);
     for (let i=0, p=0; i<w*h; i++, p+=4){
-      let t = (lastRatioMap[i] - lastLo) / (lastHi - lastLo);
-      if (t<0) t=0; if (t>1) t=1;
-      const c = colormap(t);
+      let t = (lastRatioMap[i] - lastLo) * invRange;
+      if (t<0) t=0; else if (t>1) t=1;
+      const li = ((t * (LUT_N-1)) + 0.5) | 0;
+      const c0 = cmapLUT[li*3], c1 = cmapLUT[li*3+1], c2 = cmapLUT[li*3+2];
       // texture fusion: blend colormap with local luminance to retain surface detail
-      const l = lastLuma[i];
-      const lumaMix = 0.55 + 0.9*l; // keep colors visible, modulate by brightness
-      const f = fusion;
+      const lumaMix = 0.55 + 0.9*lastLuma[i]; // keep colors visible, modulate by brightness
+      const mix = (1-f) + lumaMix*f;
       // brightness correction applies to the final displayed image (independent
       // of fusion amount), so it also has an effect at 0% texture fusion
-      od[p]   = clamp255((c[0]*(1-f) + (c[0]*lumaMix)*f) * gain);
-      od[p+1] = clamp255((c[1]*(1-f) + (c[1]*lumaMix)*f) * gain);
-      od[p+2] = clamp255((c[2]*(1-f) + (c[2]*lumaMix)*f) * gain);
+      od[p]   = clamp255(c0 * mix * gain);
+      od[p+1] = clamp255(c1 * mix * gain);
+      od[p+2] = clamp255(c2 * mix * gain);
       od[p+3] = 255;
     }
     vctx.putImageData(out, 0, 0);

@@ -118,6 +118,9 @@
   }
   #probeReadout .lbl { color: var(--text-dim); }
   #probeReadout .big { font-size: 15px; color: var(--text); font-weight: 700; }
+  /* warn when the numerator channel is down in the sensor noise floor, where
+     the ratio is dominated by quantization rather than by temperature */
+  #probeRGB.lowSignal { color: var(--danger); }
 
   #zoomReadout {
     position: absolute;
@@ -182,8 +185,10 @@
   }
   .rowline {
     display: flex; align-items: center; justify-content: space-between;
-    margin-bottom: 10px;
+    margin-bottom: 7px;
   }
+  #camRow { gap: 8px; }
+  #camRow.hidden-el { display: none !important; }
   .modeToggle {
     display: flex; gap: 6px;
     font-family: 'system-mono', monospace;
@@ -295,6 +300,8 @@
       <div class="big" id="probeRatio">--</div>
       <div class="lbl" style="margin-top:6px;">REL. LEVEL</div>
       <div class="big" id="probeLevel">--</div>
+      <div class="lbl" style="margin-top:6px;">SENSOR R/G/B</div>
+      <div id="probeRGB">--</div>
     </div>
 
     <div id="legend">
@@ -316,6 +323,16 @@
         <button type="button" id="modeRG" class="active">R / G</button>
         <button type="button" id="modeRB">R / B</button>
       </div>
+      <div class="modeToggle" id="clipGroup">
+        <button type="button" data-lo="0.005" data-hi="0.995">弱</button>
+        <button type="button" data-lo="0.02" data-hi="0.98" class="active">標準</button>
+        <button type="button" data-lo="0.10" data-hi="0.90">強</button>
+      </div>
+    </div>
+
+    <div class="rowline hidden-el" id="camRow">
+      <span class="miniLabel">レンズ</span>
+      <div class="modeToggle" id="camGroup"></div>
       <div class="miniLabel" id="resReadout">RES —</div>
     </div>
 
@@ -326,11 +343,12 @@
         <button type="button" data-stack="4" class="active">4</button>
         <button type="button" data-stack="8">8</button>
       </div>
-      <span class="miniLabel">コントラスト</span>
-      <div class="modeToggle" id="clipGroup">
-        <button type="button" data-lo="0.005" data-hi="0.995">弱</button>
-        <button type="button" data-lo="0.02" data-hi="0.98" class="active">標準</button>
-        <button type="button" data-lo="0.10" data-hi="0.90">強</button>
+      <span class="miniLabel">平滑</span>
+      <div class="modeToggle" id="blurGroup">
+        <button type="button" data-blur="0">切</button>
+        <button type="button" data-blur="1">弱</button>
+        <button type="button" data-blur="3" class="active">中</button>
+        <button type="button" data-blur="6">強</button>
       </div>
     </div>
 
@@ -397,6 +415,10 @@
   const resReadout = document.getElementById('resReadout');
   const stackGroup = document.getElementById('stackGroup');
   const clipGroup = document.getElementById('clipGroup');
+  const blurGroup = document.getElementById('blurGroup');
+  const camRow = document.getElementById('camRow');
+  const camGroup = document.getElementById('camGroup');
+  const probeRGB = document.getElementById('probeRGB');
   const toast = document.getElementById('toast');
   const dlLink = document.getElementById('dlLink');
 
@@ -421,15 +443,35 @@
   let stackCount = 4;
   // percentile clip bounds for contrast stretching
   let clipLo = 0.02, clipHi = 0.98;
+  // box-blur radius applied to the numerator/denominator channels *before* the
+  // division. Averaging the channels raises the effective photon count per
+  // sample, which matters far more than per-pixel sharpness when one channel
+  // sits near the noise floor — a ratio of two noisy small numbers is garbage.
+  let blurRadius = 3;
 
-  // ---------- Digital zoom (slider) ----------
+  let deviceId = null;   // selected camera, null = let the OS choose
+  let zoomCap = null;    // hardware zoom range, when the track exposes one
+  let hwZoom = false;    // true while zoom is handled by the camera, not by cropping
+
+  // ---------- Zoom ----------
+  // Hardware zoom keeps every sensor pixel on target; the digital fallback is a
+  // centre crop, which throws away (1 - 1/z^2) of the sensor. Always prefer
+  // hardware when the track advertises it.
   let zoomLevel = 1;
 
   function updateZoomVisual(){
-    video.style.transform = `scale(${zoomLevel})`;
-    zoomVal.textContent = zoomLevel.toFixed(1) + '×';
+    zoomVal.textContent = zoomLevel.toFixed(1) + '×' + (hwZoom ? '' : ' (D)');
+    if (hwZoom){
+      video.style.transform = 'none';
+      const track = stream && stream.getVideoTracks()[0];
+      if (track){
+        track.applyConstraints({ advanced: [{ zoom: zoomLevel }] }).catch(()=>{});
+      }
+    } else {
+      video.style.transform = `scale(${zoomLevel})`;
+    }
     if (zoomLevel > 1.02){
-      zoomReadout.textContent = zoomLevel.toFixed(1) + '×';
+      zoomReadout.textContent = zoomLevel.toFixed(1) + '×' + (hwZoom ? '' : ' DIGITAL');
       zoomReadout.style.display = 'block';
     } else {
       zoomReadout.style.display = 'none';
@@ -438,6 +480,67 @@
   zoomSlider.addEventListener('input', ()=>{
     zoomLevel = parseInt(zoomSlider.value,10) / 100;
     updateZoomVisual();
+  });
+
+  // Reads the zoom capability of the live track and retargets the slider to it.
+  function setupZoomForTrack(track){
+    zoomCap = null; hwZoom = false;
+    const caps = track.getCapabilities ? track.getCapabilities() : null;
+    if (caps && caps.zoom && typeof caps.zoom.max === 'number' && caps.zoom.max > caps.zoom.min){
+      zoomCap = caps.zoom;
+      hwZoom = true;
+      zoomSlider.min = Math.round(caps.zoom.min * 100);
+      zoomSlider.max = Math.round(caps.zoom.max * 100);
+      zoomLevel = caps.zoom.min;
+    } else {
+      zoomSlider.min = 100;
+      zoomSlider.max = 400;
+      zoomLevel = 1;
+    }
+    zoomSlider.value = Math.round(zoomLevel * 100);
+    zoomSlider.disabled = false;
+    updateZoomVisual();
+  }
+
+  // ---------- Camera (lens) selection ----------
+  // Picking the telephoto module is real optical magnification: unlike digital
+  // zoom it puts more sensor pixels on the target instead of fewer.
+  function shortLensLabel(label){
+    const l = (label || '').toLowerCase();
+    if (l.includes('ultra') || label.includes('超広角')) return '超広角';
+    if (l.includes('tele')  || label.includes('望遠'))  return '望遠';
+    if (l.includes('front') || label.includes('前面') || label.includes('フロント')) return '前面';
+    if (l.includes('dual')  || l.includes('triple') || label.includes('デュアル') || label.includes('トリプル')) return '自動';
+    if (l.includes('back')  || label.includes('背面')) return '広角';
+    return label ? label.slice(0, 6) : 'カメラ';
+  }
+
+  async function buildCameraPicker(){
+    if (!navigator.mediaDevices.enumerateDevices) return;
+    let devices = [];
+    try { devices = await navigator.mediaDevices.enumerateDevices(); } catch { return; }
+    const cams = devices.filter(d => d.kind === 'videoinput');
+    // labels are only populated once permission has been granted
+    if (cams.length < 2){ camRow.classList.add('hidden-el'); return; }
+
+    camGroup.innerHTML = '';
+    cams.forEach(cam => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = shortLensLabel(cam.label);
+      b.dataset.id = cam.deviceId;
+      if (cam.deviceId === deviceId) b.classList.add('active');
+      camGroup.appendChild(b);
+    });
+    camRow.classList.remove('hidden-el');
+  }
+
+  camGroup.addEventListener('click', (e)=>{
+    const btn = e.target.closest('button');
+    if (!btn || isCapturing) return;
+    deviceId = btn.dataset.id;
+    selectInGroup(camGroup, btn);
+    startCamera();
   });
 
   function showToast(msg){
@@ -502,34 +605,38 @@
     stopCamera();
     stateText.textContent = 'STARTING';
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: { ideal: facingMode },
-          // ask for the highest sensor resolution available; `ideal` degrades
-          // gracefully on devices that cannot deliver 4K
-          width: { ideal: 3840 },
-          height: { ideal: 2160 },
-          // a high frame rate would shorten exposure, but on iOS the 60fps
-          // modes are lower resolution — exposure is handled by physical
-          // filtering, so resolution wins here
-          frameRate: { ideal: 30 }
-        },
-        audio: false
-      });
+      const videoConstraints = {
+        // ask for the highest sensor resolution available; `ideal` degrades
+        // gracefully on devices that cannot deliver 4K
+        width: { ideal: 3840 },
+        height: { ideal: 2160 },
+        // a high frame rate would shorten exposure, but on iOS the 60fps
+        // modes are lower resolution — exposure is handled by physical
+        // filtering, so resolution wins here
+        frameRate: { ideal: 30 }
+      };
+      // an explicit lens choice must win over facingMode, which would otherwise
+      // send us back to the default wide camera
+      if (deviceId) videoConstraints.deviceId = { exact: deviceId };
+      else videoConstraints.facingMode = { ideal: facingMode };
+
+      stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints, audio: false });
       video.srcObject = stream;
+
+      const track = stream.getVideoTracks()[0];
 
       // report what the device actually granted — the 4K request is only an
       // `ideal`, so this is the way to confirm the resolution in the field
-      const st = stream.getVideoTracks()[0].getSettings();
+      const st = track.getSettings();
       resReadout.textContent = (st.width && st.height) ? `SRC ${st.width}×${st.height}` : 'SRC —';
+      if (st.deviceId) deviceId = st.deviceId;
+
+      setupZoomForTrack(track);
+      buildCameraPicker();
 
       video.classList.remove('hidden');
       viewCanvas.classList.add('hidden');
       hasCapture = false;
-      zoomLevel = 1;
-      zoomSlider.value = 100;
-      zoomSlider.disabled = false;
-      updateZoomVisual();
       saveBtn.disabled = true;
       legend.style.display = 'none';
       probeReadout.style.display = 'none';
@@ -595,6 +702,14 @@
     if (hasCapture) reprocessFromRaw();
   });
 
+  blurGroup.addEventListener('click', (e)=>{
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    blurRadius = parseInt(btn.dataset.blur, 10);
+    selectInGroup(blurGroup, btn);
+    if (hasCapture) reprocessFromRaw();
+  });
+
   // averaged RGB of the captured frames, kept as Float32 so mode switches can
   // be reprocessed without recapturing and so stacking retains sub-LSB detail
   let rawRGB = null;
@@ -637,10 +752,12 @@
       return;
     }
 
-    // crop to the region currently visible under the zoom slider level, so the
-    // analyzed image matches what was framed in the live preview
-    const cropW = vw / zoomLevel;
-    const cropH = vh / zoomLevel;
+    // Crop to the region visible under digital zoom, so the analyzed image
+    // matches what was framed. Under hardware zoom the frame is already the
+    // zoomed view, and cropping again would throw away sensor pixels twice.
+    const crop = hwZoom ? 1 : zoomLevel;
+    const cropW = vw / crop;
+    const cropH = vh / crop;
     const cropX = (vw - cropW) / 2;
     const cropY = (vh - cropH) / 2;
 
@@ -679,20 +796,63 @@
     processCurrentRaw();
   }
 
-  function computeRatioAndLuma(rgb, w, h, useMode){
+  // Separable box blur with a running sum — O(n) regardless of radius.
+  // `dst` may alias `src`: the vertical pass only ever reads the scratch buffer.
+  let blurScratch = null;
+  function boxBlurInto(src, dst, w, h, radius){
+    if (radius <= 0){ if (dst !== src) dst.set(src); return dst; }
+    if (!blurScratch || blurScratch.length < w*h) blurScratch = new Float32Array(w*h);
+    const tmp = blurScratch;
+    const win = radius*2 + 1;
+    const cx = (x) => x < 0 ? 0 : (x > w-1 ? w-1 : x);
+    const cy = (y) => y < 0 ? 0 : (y > h-1 ? h-1 : y);
+
+    for (let y=0; y<h; y++){
+      const row = y*w;
+      let sum = 0;
+      for (let k=-radius; k<=radius; k++) sum += src[row + cx(k)];
+      for (let x=0; x<w; x++){
+        tmp[row+x] = sum / win;
+        sum += src[row + cx(x+radius+1)] - src[row + cx(x-radius)];
+      }
+    }
+    for (let x=0; x<w; x++){
+      let sum = 0;
+      for (let k=-radius; k<=radius; k++) sum += tmp[cy(k)*w + x];
+      for (let y=0; y<h; y++){
+        dst[y*w+x] = sum / win;
+        sum += tmp[cy(y+radius+1)*w + x] - tmp[cy(y-radius)*w + x];
+      }
+    }
+    return dst;
+  }
+
+  function computeRatioAndLuma(rgb, w, h, useMode, radius){
     const n = w*h;
-    const ratio = new Float32Array(n);
+    const num = new Float32Array(n);   // R
+    const den = new Float32Array(n);   // G or B
     const luma = new Float32Array(n);
+    for (let i=0, q=0; i<n; i++, q+=3){
+      const r = rgb[q], g = rgb[q+1], b = rgb[q+2];
+      num[i] = r;
+      den[i] = (useMode === 'RG') ? g : b;
+      // luma is deliberately taken from the *unblurred* data, so the texture
+      // fusion slider can put sharp surface detail back over a smooth field
+      luma[i] = (0.299*r + 0.587*g + 0.114*b) / 255;
+    }
+
+    // Blur the channels, not the ratio. r/g of two independently noisy small
+    // numbers has heavy-tailed, biased noise that no amount of post-smoothing
+    // fixes; averaging the channels first is what actually raises SNR.
+    boxBlurInto(num, num, w, h, radius);
+    boxBlurInto(den, den, w, h, radius);
+
     // small enough not to distort ratios in the dark values that heavy optical
     // filtering produces, but still guards against division by zero
     const eps = 1;
-    for (let i=0, q=0; i<n; i++, q+=3){
-      const r = rgb[q], g = rgb[q+1], b = rgb[q+2];
-      const denom = (useMode === 'RG') ? g : b;
-      ratio[i] = r / (denom + eps);
-      luma[i] = (0.299*r + 0.587*g + 0.114*b) / 255;
-    }
-    return { ratio, luma };
+    // reuse `num` as the output — index i is read before it is overwritten
+    for (let i=0; i<n; i++) num[i] = num[i] / (den[i] + eps);
+    return { ratio: num, luma };
   }
 
   function percentileClip(arr, loP, hiP){
@@ -707,7 +867,7 @@
   }
 
   function processCurrentRaw(){
-    const { ratio, luma } = computeRatioAndLuma(rawRGB, lastW, lastH, mode);
+    const { ratio, luma } = computeRatioAndLuma(rawRGB, lastW, lastH, mode, blurRadius);
     lastRatioMap = ratio;
     lastLuma = luma;
     const [lo, hi] = percentileClip(ratio, clipLo, clipHi);
@@ -807,6 +967,16 @@
     level = Math.min(1, Math.max(0, level));
     probeRatio.textContent = r.toFixed(3);
     probeLevel.textContent = (level*100).toFixed(0) + '%';
+
+    // Raw sensor levels at this point. If the numerator channel is only a few
+    // counts out of 255 the ratio is quantization noise, not temperature —
+    // that means the optical filter is eating the channel the method needs.
+    if (rawRGB){
+      const q = idx*3;
+      const rr = rawRGB[q], gg = rawRGB[q+1], bb = rawRGB[q+2];
+      probeRGB.textContent = `${rr.toFixed(0)} / ${gg.toFixed(0)} / ${bb.toFixed(0)}`;
+      probeRGB.classList.toggle('lowSignal', rr < 12);
+    }
   }
 
   document.getElementById('stage').addEventListener('click', (e)=>{
